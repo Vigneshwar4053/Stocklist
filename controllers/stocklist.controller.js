@@ -15,8 +15,9 @@ export const stocklistBuy = async (req, res) => {
   session.startTransaction();
 
   try {
-    if (!req.user) return res.status(401).json({ message: 'Unauthorized' });
-    if (req.user.role !== 'stocklist') return res.status(403).json({ message: 'Only stocklist can call this' });
+    if (!req.user || req.user.role !== 'stocklist') {
+      return res.status(403).json({ message: 'Only stocklist can call this' });
+    }
 
     const { items } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
@@ -36,8 +37,8 @@ export const stocklistBuy = async (req, res) => {
     }
 
     const prodMap = new Map(products.map(p => [p._id.toString(), p]));
-
     const orderItems = [];
+
     for (const it of items) {
       const { productId, quantity } = it;
       if (!productId || !quantity || quantity <= 0) {
@@ -64,7 +65,7 @@ export const stocklistBuy = async (req, res) => {
       }
 
       // Reduce owner's stock
-      prod.stock = prod.stock - quantity;
+      prod.stock -= quantity;
       await prod.save({ session });
 
       // Upsert into stocklist inventory
@@ -78,7 +79,7 @@ export const stocklistBuy = async (req, res) => {
         productId,
         name: prod.name,
         quantity,
-        price: prod.price
+        price: prod.actualPrice || prod.price // adjust if you renamed field
       });
     }
 
@@ -105,7 +106,7 @@ export const stocklistBuy = async (req, res) => {
     const invPayload = inventory.map(row => ({
       productId: row.productId._id,
       name: row.productId.name,
-      price: row.productId.price,
+      price: row.productId.actualPrice || row.productId.price,
       quantity: row.quantity
     }));
 
@@ -124,15 +125,16 @@ export const stocklistBuy = async (req, res) => {
  */
 export const dashboard = async (req, res) => {
   try {
-    if (!req.user) return res.status(401).json({ message: 'Unauthorized' });
-    if (req.user.role !== 'stocklist') return res.status(403).json({ message: 'Only stocklist can access dashboard' });
+    if (!req.user || req.user.role !== 'stocklist') {
+      return res.status(403).json({ message: 'Only stocklist can access dashboard' });
+    }
 
     const inventory = await StocklistInventory.find({ stocklistId: req.user.id }).populate('productId');
 
     const invPayload = inventory.map(row => ({
       productId: row.productId._id,
       name: row.productId.name,
-      price: row.productId.price,
+      price: row.productId.actualPrice || row.productId.price,
       quantity: row.quantity
     }));
 
