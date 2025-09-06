@@ -5,10 +5,7 @@ import { StocklistInventory } from '../models/stocklistInventory.model.js';
 import { Order } from '../models/order.model.js';
 
 /**
- * Stocklist buys product(s):
- * - Decrease owner's stock
- * - Increase stocklist's inventory
- * - Record an order
+ * stocklistBuy
  */
 export const stocklistBuy = async (req, res) => {
   const session = await mongoose.startSession();
@@ -16,18 +13,19 @@ export const stocklistBuy = async (req, res) => {
 
   try {
     if (!req.user || req.user.role !== 'stocklist') {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(403).json({ message: 'Only stocklist can call this' });
     }
 
-    const { items } = req.body;
+    const { items } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) {
       await session.abortTransaction();
       session.endSession();
       return res.status(400).json({ message: 'items array required' });
     }
 
-    // Fetch products
-    const prodIds = items.map(i => i.productId);
+    const prodIds = [...new Set(items.map(i => i.productId))];
     const products = await Product.find({ _id: { $in: prodIds } }).session(session);
 
     if (products.length !== prodIds.length) {
@@ -40,50 +38,56 @@ export const stocklistBuy = async (req, res) => {
     const orderItems = [];
 
     for (const it of items) {
-      const { productId, quantity } = it;
-      if (!productId || !quantity || quantity <= 0) {
+      const productId = String(it.productId || '').trim();
+      const variantId = String(it.variantId || '').trim();
+      const quantity = Number(it.quantity || 0);
+
+      if (!productId || !variantId || !Number.isFinite(quantity) || quantity <= 0) {
         await session.abortTransaction();
         session.endSession();
-        return res.status(422).json({ message: 'productId and positive quantity required' });
+        return res.status(422).json({ message: 'productId, variantId and positive quantity required' });
       }
 
-      const prod = prodMap.get(productId);
-      if (!prod) {
+      const product = prodMap.get(productId);
+      if (!product) {
         await session.abortTransaction();
         session.endSession();
         return res.status(404).json({ message: `Product not found: ${productId}` });
       }
 
-      // Check owner stock
-      if (prod.stock < quantity) {
+      const variant = product.variants.id(variantId);
+      if (!variant) {
         await session.abortTransaction();
         session.endSession();
-        return res.status(409).json({
-          message: `Insufficient owner stock for ${prod.name}`,
-          available: prod.stock
-        });
+        return res.status(404).json({ message: `Variant not found for product ${product.name}` });
       }
 
-      // Reduce owner's stock
-      prod.stock -= quantity;
-      await prod.save({ session });
+      if (variant.quantity < quantity) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(409).json({ message: `Insufficient owner stock for ${product.name} (${variant.name})`, available: variant.quantity });
+      }
 
-      // Upsert into stocklist inventory
+      variant.quantity = variant.quantity - quantity;
+      product.markModified('variants');
+      await product.save({ session });
+
       await StocklistInventory.findOneAndUpdate(
-        { stocklistId: req.user.id, productId },
+        { stocklistId: req.user.id, productId, variantId },
         { $inc: { quantity } },
         { new: true, upsert: true, session }
       );
 
       orderItems.push({
         productId,
-        name: prod.name,
+        variantId,
+        variantName: variant.name,
         quantity,
-        price: prod.actualPrice || prod.price // adjust if you renamed field
+        unitPrice: variant.price
       });
     }
 
-    const totalAmount = orderItems.reduce((s, it) => s + it.price * it.quantity, 0);
+    const totalAmount = orderItems.reduce((s, it) => s + it.unitPrice * it.quantity, 0);
 
     const [order] = await Order.create(
       [
@@ -100,15 +104,19 @@ export const stocklistBuy = async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    // Inventory snapshot
     const inventory = await StocklistInventory.find({ stocklistId: req.user.id }).populate('productId');
-
-    const invPayload = inventory.map(row => ({
-      productId: row.productId._id,
-      name: row.productId.name,
-      price: row.productId.actualPrice || row.productId.price,
-      quantity: row.quantity
-    }));
+    const invPayload = inventory.map(row => {
+      const prod = row.productId;
+      const variant = prod.variants.id(row.variantId);
+      return {
+        productId: prod._id,
+        productName: prod.name,
+        variantId: row.variantId,
+        variantName: variant ? variant.name : null,
+        price: variant ? variant.price : (prod.actualPrice || 0),
+        quantity: row.quantity
+      };
+    });
 
     return res.status(201).json({ order, inventory: invPayload });
   } catch (err) {
@@ -120,23 +128,26 @@ export const stocklistBuy = async (req, res) => {
 };
 
 /**
- * Stocklist dashboard:
- * Show all inventory for this stocklist
+ * dashboard
  */
 export const dashboard = async (req, res) => {
   try {
-    if (!req.user || req.user.role !== 'stocklist') {
-      return res.status(403).json({ message: 'Only stocklist can access dashboard' });
-    }
+    if (!req.user || req.user.role !== 'stocklist') return res.status(403).json({ message: 'Only stocklist allowed' });
 
     const inventory = await StocklistInventory.find({ stocklistId: req.user.id }).populate('productId');
 
-    const invPayload = inventory.map(row => ({
-      productId: row.productId._id,
-      name: row.productId.name,
-      price: row.productId.actualPrice || row.productId.price,
-      quantity: row.quantity
-    }));
+    const invPayload = inventory.map(row => {
+      const prod = row.productId;
+      const variant = prod.variants.id(row.variantId);
+      return {
+        productId: prod._id,
+        productName: prod.name,
+        variantId: row.variantId,
+        variantName: variant ? variant.name : null,
+        price: variant ? variant.price : (prod.actualPrice || 0),
+        quantity: row.quantity
+      };
+    });
 
     return res.json({ stocklistId: req.user.id, inventory: invPayload });
   } catch (err) {

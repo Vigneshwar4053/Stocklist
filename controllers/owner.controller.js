@@ -2,29 +2,60 @@
 import { Product } from '../models/product.model.js';
 import { User } from '../models/user.model.js';
 
-/**
- * Helper to safely parse numbers from request body
- */
+/* ---------------- helpers ---------------- */
 function toNumber(v, fallback = undefined) {
-  if (v === undefined || v === null) return fallback;
+  if (v === undefined || v === null || v === '') return fallback;
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
+function normalizeIncomingVariants(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw); } catch (e) { return []; }
+  }
+  return [];
+}
+function mergeVariants(existingVariants, incomingVariants) {
+  const map = new Map((existingVariants || []).map(v => [String(v.name).trim(), v]));
+  for (const inv of incomingVariants) {
+    if (!inv || !inv.name) continue;
+    const name = String(inv.name).trim();
+    const price = toNumber(inv.price);
+    const qty = Math.max(0, Math.floor(toNumber(inv.quantity, 0) || 0));
+    const sku = inv.sku || '';
+    const barcode = inv.barcode || '';
+
+    if (map.has(name)) {
+      const ev = map.get(name);
+      if (price !== undefined) ev.price = price;
+      if (qty > 0) ev.quantity = ev.quantity + qty;
+      if (sku) ev.sku = sku;
+      if (barcode) ev.barcode = barcode;
+    } else {
+      existingVariants.push({
+        name,
+        price: price !== undefined ? price : 0,
+        quantity: qty,
+        sku,
+        barcode
+      });
+    }
+  }
+  return existingVariants;
+}
+
+/* ---------------- controllers ---------------- */
 
 /**
- * Owner -> create a stocklist account (role: 'stocklist')
  * POST /api/owner/create-stocklist
- * Body: { username, password }
  */
 export const createStocklist = async (req, res) => {
   try {
     const body = req.body || {};
-    const username = body.username;
+    const username = (body.username || '').trim();
     const password = body.password;
-
-    if (!username || !password) {
-      return res.status(400).json({ message: 'username & password required' });
-    }
+    if (!username || !password) return res.status(400).json({ message: 'username & password required' });
 
     const exists = await User.findOne({ username });
     if (exists) return res.status(409).json({ message: 'Username already exists' });
@@ -35,80 +66,136 @@ export const createStocklist = async (req, res) => {
     console.error('createStocklist error', err);
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
+}
+
+/* ---------- robust addProduct with final coercion & logging ---------- */
+
+const parseVariants = raw => {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  }
+  return null;
 };
 
-/**
- * Add product (or update existing by name for same owner).
- * Accepts JSON fields (for multipart version you can adapt).
- * POST /api/owner/add-product
- * Body: { name, description?, actualPrice, discountPrice?, quantity?, sku?, barcode?, variants? }
- */
 export const addProduct = async (req, res) => {
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
 
+    // debug logs to inspect incoming body/files
+    console.log('>>> addProduct - received body keys:', Object.keys(req.body || {}));
+    if (req.files) console.log('>>> addProduct - files keys:', Object.keys(req.files));
+
     const body = req.body || {};
+
+    // parse & show the raw variants
+    const rawVariants = body.variants;
+    console.log('>>> addProduct - raw variants:', rawVariants);
+    const incomingVariants = parseVariants(rawVariants);
+    if (rawVariants && incomingVariants === null) {
+      return res.status(400).json({ message: 'Invalid JSON in variants field' });
+    }
+
+    // basic fields
     const name = (body.name || '').trim();
     const description = body.description || '';
-    const actualPrice = toNumber(body.actualPrice);
-    const discountPrice = toNumber(body.discountPrice, undefined);
-    const quantity = toNumber(body.quantity, 0) || 0;
     const sku = body.sku || '';
     const barcode = body.barcode || '';
-    let variants = [];
+    const actualPrice = body.actualPrice !== undefined ? toNumber(body.actualPrice) : undefined;
+    const quantity = body.quantity !== undefined ? Math.max(0, Math.floor(toNumber(body.quantity, 0) || 0)) : 0;
 
-    if (body.variants) {
-      try { variants = typeof body.variants === 'string' ? JSON.parse(body.variants) : body.variants; }
-      catch (e) { variants = []; }
+    if (!name) return res.status(400).json({ message: 'name is required' });
+    if ((!incomingVariants || incomingVariants.length === 0) && actualPrice === undefined) {
+      return res.status(400).json({ message: 'Either variants (with price) or actualPrice must be provided' });
     }
 
-    if (!name || actualPrice === undefined) {
-      return res.status(400).json({ message: 'name and actualPrice are required' });
+    // normalize & validate incoming variants
+    let normalized = [];
+    if (incomingVariants && incomingVariants.length) {
+      const errs = [];
+      for (let i = 0; i < incomingVariants.length; i++) {
+        const v = incomingVariants[i];
+        if (!v || typeof v !== 'object') { errs.push(`variants[${i}] must be an object`); continue; }
+        const vname = (v.name || '').toString().trim();
+        const vprice = toNumber(v.price);
+        const vqty = v.quantity !== undefined ? Math.max(0, Math.floor(toNumber(v.quantity, 0) || 0)) : 0;
+        const vsku = v.sku || '';
+        const vbarcode = v.barcode || '';
+
+        if (!vname) errs.push(`variants[${i}].name is required`);
+        if (vprice === undefined) errs.push(`variants[${i}].price is required and must be a number`);
+        if (v.quantity !== undefined && Number.isNaN(Number(v.quantity))) errs.push(`variants[${i}].quantity must be a number`);
+
+        normalized.push({ name: vname, price: vprice, quantity: vqty, sku: vsku, barcode: vbarcode });
+      }
+      console.log('>>> addProduct - normalized variants:', normalized);
+      if (errs.length) return res.status(400).json({ message: 'Invalid variants', errors: errs });
     }
 
-    // check existing by same owner & name
-    const existing = await Product.findOne({ createdBy: req.user.id, name });
+    // find existing product
+    let product = await Product.findOne({ createdBy: req.user.id, name });
 
-    if (existing) {
-      // update price/description/quantity/etc.
-      existing.description = description;
-      existing.actualPrice = actualPrice;
-      if (discountPrice !== undefined) existing.discountPrice = discountPrice;
-      if (Number.isFinite(quantity) && quantity > 0) existing.quantity = existing.quantity + Math.floor(quantity);
-      if (sku) existing.sku = sku;
-      if (barcode) existing.barcode = barcode;
-      if (variants && variants.length) existing.variants = variants;
-      await existing.save();
-      return res.status(200).json({ product: existing, message: 'Existing product updated (stock/fields updated).' });
+    if (product) {
+      // update existing
+      if (normalized.length) {
+        product.variants = mergeVariants(product.variants || [], normalized);
+      } else {
+        if (actualPrice !== undefined) product.actualPrice = actualPrice;
+        if (Number.isFinite(quantity) && quantity > 0) product.quantity = (product.quantity || 0) + quantity;
+      }
+
+      product.description = description || product.description;
+      if (sku) product.sku = sku;
+      if (barcode) product.barcode = barcode;
+
+      await product.save();
+      return res.status(200).json({ product, message: 'Existing product updated' });
     }
 
-    // create new product
-    const product = await Product.create({
-      name,
-      description,
-      actualPrice,
-      discountPrice,
-      quantity: Math.max(0, Math.floor(quantity)),
-      sku,
-      barcode,
-      variants,
-      createdBy: req.user.id
-    });
+    // prepare create payload with forced numeric coercion
+    const toCreate = { name, description, createdBy: req.user.id, sku, barcode };
+    if (normalized.length) {
+      // final coercion: ensure price is finite number for each variant
+      const badIndexes = [];
+      toCreate.variants = normalized.map((v, idx) => {
+        const p = Number(v.price);
+        if (!Number.isFinite(p)) badIndexes.push(idx);
+        return {
+          name: v.name,
+          price: p,
+          quantity: Number.isFinite(Number(v.quantity)) ? Number(v.quantity) : 0,
+          sku: v.sku || '',
+          barcode: v.barcode || ''
+        };
+      });
+      if (badIndexes.length) {
+        return res.status(400).json({ message: 'Invalid variant prices', errors: badIndexes.map(i => `variants[${i}].price invalid`) });
+      }
+    } else {
+      toCreate.actualPrice = Number(actualPrice || 0);
+      toCreate.quantity = Math.max(0, Math.floor(quantity || 0));
+    }
 
-    return res.status(201).json({ product });
+    // final log - exactly what will be sent to mongoose
+    console.log('>>> addProduct - final toCreate.variants:', toCreate.variants);
+    console.log('>>> addProduct - final payload (toCreate):', toCreate);
+
+    // create in DB
+    const created = await Product.create(toCreate);
+    return res.status(201).json({ product: created });
   } catch (err) {
-    console.error('addProduct error', err);
-    if (err.code === 11000) return res.status(409).json({ message: 'Product with same name already exists' });
-    return res.status(500).json({ message: 'Server error', error: err.message });
+    console.error('addProduct error:', err);
+    if (err && err.name === 'ValidationError') {
+      const list = Object.values(err.errors).map(e => e.message);
+      return res.status(400).json({ message: 'Validation error', errors: list });
+    }
+    return res.status(500).json({ message: 'Server error', error: err.message || String(err) });
   }
 };
 
-/**
- * Update product: price, quantity (adjust or set), sku, barcode, variants, description
- * PATCH /api/owner/product/:id
- * Body supports JSON with fields:
- * - setQuantity (absolute), adjustQuantity (+/-), actualPrice, discountPrice, sku, barcode, variants (JSON)
- */
+/* ---------- other owner handlers (update/list/get/delete) ---------- */
+
 export const updateProduct = async (req, res) => {
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
@@ -119,17 +206,16 @@ export const updateProduct = async (req, res) => {
     if (product.createdBy.toString() !== req.user.id) return res.status(403).json({ message: 'Not your product' });
 
     const body = req.body || {};
-
-    if (body.name) product.name = body.name;
+    if (body.name) product.name = String(body.name).trim();
     if (body.description) product.description = body.description;
 
     if (body.actualPrice !== undefined) {
       const p = toNumber(body.actualPrice);
-      if (!Number.isNaN(p)) product.actualPrice = p;
+      if (p !== undefined) product.actualPrice = p;
     }
     if (body.discountPrice !== undefined) {
       const dp = toNumber(body.discountPrice);
-      if (!Number.isNaN(dp)) product.discountPrice = dp;
+      if (dp !== undefined) product.discountPrice = dp;
     }
 
     if (body.setQuantity !== undefined) {
@@ -143,8 +229,9 @@ export const updateProduct = async (req, res) => {
     if (body.sku) product.sku = body.sku;
     if (body.barcode) product.barcode = body.barcode;
 
-    if (body.variants) {
-      try { product.variants = typeof body.variants === 'string' ? JSON.parse(body.variants) : body.variants; } catch(e) {}
+    const incomingVariants = normalizeIncomingVariants(body.variants);
+    if (incomingVariants.length) {
+      product.variants = mergeVariants(product.variants || [], incomingVariants);
     }
 
     await product.save();
@@ -155,10 +242,6 @@ export const updateProduct = async (req, res) => {
   }
 };
 
-/**
- * List owner products
- * GET /api/owner/products
- */
 export const listProducts = async (req, res) => {
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
@@ -169,12 +252,9 @@ export const listProducts = async (req, res) => {
     return res.status(500).json({ message: 'Server error' });
   }
 };
+export const getProducts = listProducts;
 
-/**
- * Get single product by id (owner only)
- * GET /api/owner/product/:id
- */
-export const getProducts = async (req, res) => {
+export const getProduct = async (req, res) => {
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
     const product = await Product.findById(req.params.id);
@@ -182,15 +262,11 @@ export const getProducts = async (req, res) => {
     if (product.createdBy.toString() !== req.user.id) return res.status(403).json({ message: 'Not your product' });
     return res.json({ product });
   } catch (err) {
-    console.error('getProducts error', err);
+    console.error('getProduct error', err);
     return res.status(500).json({ message: 'Server error' });
   }
 };
 
-/**
- * Delete product (owner only)
- * DELETE /api/owner/product/:id
- */
 export const deleteProduct = async (req, res) => {
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
