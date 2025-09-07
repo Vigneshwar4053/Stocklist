@@ -1,6 +1,7 @@
 // routes/owner.routes.js
 import express from 'express';
-import { auth, requireRole } from '../middleware/auth.js';
+import auth from '../middleware/auth.js';
+import requireRole from '../middleware/requireRole.js';
 import upload from '../middleware/upload.js';
 import {
   createStocklist,
@@ -18,10 +19,7 @@ const router = express.Router();
 router.post('/create-stocklist', auth, requireRole('owner'), createStocklist);
 
 // add product (multipart; images[] and invoices[] optional)
-router.post('/add-product', auth, requireRole('owner'), upload.fields([
-  { name: 'images', maxCount: 6 },
-  { name: 'invoices', maxCount: 4 }
-]), addProduct);
+router.post('/add-product', auth, requireRole('owner'), upload.any(), addProduct);
 
 // update product (supports multipart OR JSON)
 router.patch('/product/:id', auth, requireRole('owner'), upload.fields([

@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { body } from 'express-validator';
 import { customerBuy } from "../controllers/customer.controller.js";
-import { auth, requireRole } from "../middleware/auth.js";
+import auth from '../middleware/auth.js';
+import requireRole from '../middleware/requireRole.js';
 import { validate } from "../middleware/validate.js";
 
 

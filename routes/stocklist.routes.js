@@ -1,6 +1,7 @@
 import express from 'express';
 import { stocklistBuy, dashboard } from '../controllers/stocklist.controller.js';
-import { auth, requireRole } from '../middleware/auth.js';
+import auth from '../middleware/auth.js';
+import requireRole from '../middleware/requireRole.js';
 
 const router = express.Router();
 
