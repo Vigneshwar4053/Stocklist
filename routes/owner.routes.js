@@ -1,34 +1,39 @@
-// routes/owner.routes.js
 import express from 'express';
 import auth from '../middleware/auth.js';
 import requireRole from '../middleware/requireRole.js';
-import upload from '../middleware/upload.js';
+import upload from '../middleware/uploadDisk.js'; // <- disk-based multer
+
 import {
   createStocklist,
   addProduct,
   updateProduct,
-  getProducts,
-  
-  deleteProduct,
-  listProducts
+  getProduct,
+  listProducts,
+  deleteProduct
 } from '../controllers/owner.controller.js';
 
 const router = express.Router();
 
-// stocklist creation (JSON)
 router.post('/create-stocklist', auth, requireRole('owner'), createStocklist);
 
-// add product (multipart; images[] and invoices[] optional)
-router.post('/add-product', auth, requireRole('owner'), upload.any(), addProduct);
+router.post('/add-product', auth, requireRole('owner'),
+  upload.fields([
+    { name: 'images', maxCount: 8 },
+    { name: 'invoice', maxCount: 1 }
+  ]),
+  addProduct
+);
 
-// update product (supports multipart OR JSON)
-router.patch('/product/:id', auth, requireRole('owner'), upload.fields([
-  { name: 'images', maxCount: 6 },
-  { name: 'invoices', maxCount: 4 }
-]), updateProduct);
+router.patch('/product/:id', auth, requireRole('owner'),
+  upload.fields([
+    { name: 'images', maxCount: 8 },
+    { name: 'invoice', maxCount: 1 }
+  ]),
+  updateProduct
+);
 
-router.get('/products', auth, requireRole('owner'),getProducts);
-router.get('/product/:id', auth, requireRole('owner'),  getProducts);
+router.get('/products', auth, requireRole('owner'), listProducts);
+router.get('/product/:id', auth, requireRole('owner'), getProduct);
 router.delete('/product/:id', auth, requireRole('owner'), deleteProduct);
 
 export default router;

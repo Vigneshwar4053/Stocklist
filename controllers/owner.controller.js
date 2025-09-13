@@ -1,7 +1,9 @@
-// controllers/owner.controller.js
+// controllers/owner.controller.js 
+import fs from 'fs/promises';
+import path from 'path';
 import { Product } from '../models/product.model.js';
-import { User } from '../models/user.model.js';
-
+import imagekit from '../lib/imagekit.js';
+import { uploadFilePathToImageKit } from '../utils/imageUpload.js'; // or inline the function
 /* ---------------- helpers ---------------- */
 const toNumber = (v, fallback = undefined) => {
   if (v === undefined || v === null || v === '') return fallback;
@@ -19,13 +21,14 @@ const parseVariants = raw => {
 };
 
 function mergeVariants(existingVariants, incomingVariants) {
-  const map = new Map((existingVariants || []).map(v => [String(v.name).trim(), v]));
+  const map = new Map((existingVariants || []).map(v => [String(v.name || v.form).trim(), v]));
   for (const inv of incomingVariants) {
-    if (!inv || !inv.name) continue;
-    const name = String(inv.name).trim();
-    const price = toNumber(inv.price);
+    if (!inv || (!inv.name && !inv.form)) continue;
+    const name = String(inv.name || inv.form).trim();
+    const price = toNumber(inv.price ?? inv.originalPrice);
     const qty = Math.max(0, Math.floor(toNumber(inv.quantity, 0) || 0));
     const sku = inv.sku || '';
+    const images = inv.images || [];
     const barcode = inv.barcode || '';
 
     if (map.has(name)) {
@@ -33,13 +36,17 @@ function mergeVariants(existingVariants, incomingVariants) {
       if (price !== undefined) ev.price = price;
       if (qty > 0) ev.quantity = (ev.quantity || 0) + qty;
       if (sku) ev.sku = sku;
+      if (images && images.length) ev.images = (ev.images || []).concat(images);
       if (barcode) ev.barcode = barcode;
     } else {
       existingVariants.push({
         name,
+        form: name,
+        originalPrice: price !== undefined ? price : 0,
         price: price !== undefined ? price : 0,
         quantity: qty,
         sku,
+        images,
         barcode
       });
     }
@@ -56,10 +63,42 @@ const generateSku = (base = 'PRD') => {
 };
 
 const generateBarcode = () => {
-  // 12-digit numeric string
   const n = Math.floor(Math.random() * 1e12);
   return n.toString().padStart(12, '0');
 };
+
+/* ImageKit uploader helper */
+async function uploadBufferToImageKit(buffer, originalname = 'file', folder = '/products') {
+  if (!imagekit || typeof imagekit.upload !== 'function') {
+    throw new Error('imagekit client not configured');
+  }
+  const safeName = (originalname || 'file').replace(/[^\w.-]/g, '_').slice(0, 80);
+  const fileName = `${Date.now()}_${safeName}`;
+  const resp = await imagekit.upload({
+    file: buffer,
+    fileName,
+    folder
+  });
+  return resp?.url || resp?.filePath || null;
+}
+
+/* Schema-aware mapping helper for images */
+function mapImageUrlsToSchema(urls = []) {
+  try {
+    const path = Product.schema.path('images');
+    if (!path) return urls.slice();
+
+    if (path.instance === 'Array' && path.caster && path.caster.instance === 'String') {
+      // schema: images: [String]
+      return urls.slice();
+    }
+
+    // otherwise assume subdocument array -> map to objects with { url }
+    return urls.map(u => ({ url: u }));
+  } catch (e) {
+    return urls.slice();
+  }
+}
 
 /* ---------------- controllers ---------------- */
 
@@ -86,199 +125,133 @@ export const createStocklist = async (req, res) => {
   }
 };
 
-/* ---------- addProduct (stores files as Buffers and ensures sku/barcode) ---------- */
+/* ---------- addProduct ---------- */
 export const addProduct = async (req, res) => {
+  // req.files provided by multer.diskStorage middleware
+  // expects upload.fields([{ name: 'images' }, { name: 'invoice' }])
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
 
-    // debug
     console.log('>>> addProduct body keys:', Object.keys(req.body || {}));
     if (req.files) console.log('>>> addProduct files keys:', Object.keys(req.files));
 
     const body = req.body || {};
-    const rawVariants = body.variants;
-    const incomingVariants = parseVariants(rawVariants);
-    if (rawVariants && incomingVariants === null) {
-      return res.status(400).json({ message: 'Invalid JSON in variants field' });
-    }
+    const prodName = (body.name || body.prodName || '').trim();
+    if (!prodName) return res.status(400).json({ message: 'Product name required' });
 
-    const name = (body.name || '').trim();
-    const description = body.description || '';
-    let sku = (body.sku || '').toString().trim();
-    let barcode = (body.barcode || '').toString().trim();
-    const actualPrice = body.actualPrice !== undefined ? toNumber(body.actualPrice) : undefined;
-    const quantity = body.quantity !== undefined ? Math.max(0, Math.floor(toNumber(body.quantity, 0) || 0)) : 0;
-
-    if (!name) return res.status(400).json({ message: 'name is required' });
-    if ((!incomingVariants || incomingVariants.length === 0) && actualPrice === undefined) {
-      return res.status(400).json({ message: 'Either variants (with price) or actualPrice must be provided' });
-    }
-
-    // normalize & validate variants
-    let normalized = [];
-    if (incomingVariants && incomingVariants.length) {
-      const errs = [];
-      for (let i = 0; i < incomingVariants.length; i++) {
-        const v = incomingVariants[i];
-        if (!v || typeof v !== 'object') { errs.push(`variants[${i}] must be an object`); continue; }
-        const vname = (v.name || '').toString().trim();
-        const vprice = toNumber(v.price);
-        const vqty = v.quantity !== undefined ? Math.max(0, Math.floor(toNumber(v.quantity, 0) || 0)) : 0;
-        const vsku = v.sku || '';
-        const vbarcode = v.barcode || '';
-
-        if (!vname) errs.push(`variants[${i}].name is required`);
-        if (vprice === undefined) errs.push(`variants[${i}].price is required and must be a number`);
-        if (v.quantity !== undefined && Number.isNaN(Number(v.quantity))) errs.push(`variants[${i}].quantity must be a number`);
-
-        normalized.push({ name: vname, price: vprice, quantity: vqty, sku: vsku, barcode: vbarcode });
-      }
-      if (errs.length) return res.status(400).json({ message: 'Invalid variants', errors: errs });
-    }
-
-    // handle files (multer memoryStorage expected)
-    let imagesPayload = [];
-    let invoicePayload = null;
-
-    if (req.files) {
-      // preferred shape: req.files.images (array), req.files.invoice (array with one)
-      if (req.files.images && Array.isArray(req.files.images)) {
-        imagesPayload = req.files.images.map(f => ({ filename: f.originalname, mimeType: f.mimetype, data: f.buffer }));
-      }
-      if (req.files.invoice && Array.isArray(req.files.invoice) && req.files.invoice[0]) {
-        const f = req.files.invoice[0];
-        invoicePayload = { filename: f.originalname, mimeType: f.mimetype, data: f.buffer };
-      }
-
-      // fallback if upload.any() used (req.files is array)
-      if ((!imagesPayload || imagesPayload.length === 0) && Array.isArray(req.files)) {
-        for (const f of req.files) {
-          if (f.fieldname === 'images') imagesPayload.push({ filename: f.originalname, mimeType: f.mimetype, data: f.buffer });
-          else if (f.fieldname === 'invoice' && !invoicePayload) invoicePayload = { filename: f.originalname, mimeType: f.mimetype, data: f.buffer };
-        }
-      }
-    }
-
-    // fallback: allow base64 JSON in body.images / body.invoice
-    if ((!imagesPayload || imagesPayload.length === 0) && body.images) {
-      try {
-        const arr = Array.isArray(body.images) ? body.images : (typeof body.images === 'string' ? JSON.parse(body.images) : []);
-        for (const item of arr || []) {
-          if (!item || !item.data) continue;
-          const parts = item.data.split(',');
-          const dataBase64 = parts.length === 2 ? parts[1] : parts[0];
-          const buf = Buffer.from(dataBase64, 'base64');
-          const mime = parts[0] && parts[0].includes(':') ? parts[0].split(';')[0].split(':')[1] : (item.mimeType || 'application/octet-stream');
-          imagesPayload.push({ filename: item.filename || 'file', mimeType: mime, data: buf });
-        }
-      } catch (e) { /* ignore */ }
-    }
-    if (!invoicePayload && body.invoice) {
-      try {
-        const inv = typeof body.invoice === 'string' ? JSON.parse(body.invoice) : body.invoice;
-        if (inv && inv.data) {
-          const parts = inv.data.split(',');
-          const dataBase64 = parts.length === 2 ? parts[1] : parts[0];
-          const buf = Buffer.from(dataBase64, 'base64');
-          const mime = parts[0] && parts[0].includes(':') ? parts[0].split(';')[0].split(':')[1] : (inv.mimeType || 'application/octet-stream');
-          invoicePayload = { filename: inv.filename || 'invoice', mimeType: mime, data: buf };
-        }
-      } catch (e) {}
-    }
-
-    // find existing product
-    let product = await Product.findOne({ createdBy: req.user.id, name });
-
-    if (product) {
-      // update existing
-      if (normalized.length) {
-        product.variants = mergeVariants(product.variants || [], normalized);
-      } else {
-        if (actualPrice !== undefined) product.actualPrice = actualPrice;
-        if (Number.isFinite(quantity) && quantity > 0) product.quantity = (product.quantity || 0) + quantity;
-      }
-
-      // append images
-      if (imagesPayload.length) {
-        product.images = product.images || [];
-        for (const img of imagesPayload) product.images.push({ filename: img.filename, mimeType: img.mimeType, data: img.data });
-      }
-      // invoice
-      if (invoicePayload) product.invoice = { filename: invoicePayload.filename, mimeType: invoicePayload.mimeType, data: invoicePayload.data };
-
-      product.description = description || product.description;
-      // set product-level sku/barcode if provided; else keep existing; else generate
-      if (sku) product.sku = sku;
-      if (barcode) product.barcode = barcode;
-      if (!product.sku || product.sku === '') {
-        // prefer first variant sku if exists
-        if (product.variants && product.variants.length && product.variants[0].sku) product.sku = product.variants[0].sku;
-        else product.sku = generateSku(name);
-      }
-      if (!product.barcode || product.barcode === '') {
-        if (product.variants && product.variants.length && product.variants[0].barcode) product.barcode = product.variants[0].barcode;
-        else product.barcode = generateBarcode();
-      }
-
-      await product.save();
-      return res.status(200).json({ product, message: 'Existing product updated' });
-    }
-
-    // create new product
-    const toCreate = {
-      name,
-      description,
-      createdBy: req.user.id,
-      sku: sku || undefined,
-      barcode: barcode || undefined,
-      images: imagesPayload.map(i => ({ filename: i.filename, mimeType: i.mimeType, data: i.data })),
-      invoice: invoicePayload ? { filename: invoicePayload.filename, mimeType: invoicePayload.mimeType, data: invoicePayload.data } : undefined
+    // parse variants (same robust parser you had)
+    const parseVariants = raw => {
+      if (!raw) return [];
+      if (Array.isArray(raw)) return raw;
+      if (typeof raw === 'string') { try { return JSON.parse(raw); } catch(e) { return null; } }
+      return null;
     };
-
-    if (normalized.length) {
-      toCreate.variants = normalized.map(v => ({
-        name: v.name,
-        price: Number(v.price),
-        quantity: Number(v.quantity || 0),
-        sku: v.sku || '',
-        barcode: v.barcode || ''
-      }));
-    } else {
-      toCreate.actualPrice = Number(actualPrice || 0);
-      toCreate.quantity = Math.max(0, Math.floor(quantity || 0));
+    const incomingVariants = parseVariants(body.variants);
+    if (body.variants && incomingVariants === null) {
+      return res.status(400).json({ message: 'Invalid JSON variants' });
     }
 
-    // ensure sku/barcode filled: prefer top-level, else first variant, else generate
-    if (!toCreate.sku || toCreate.sku === '') {
-      if (toCreate.variants && toCreate.variants.length && toCreate.variants[0].sku) {
-        toCreate.sku = toCreate.variants[0].sku;
-      } else {
-        toCreate.sku = generateSku(name);
-      }
-    }
-    if (!toCreate.barcode || toCreate.barcode === '') {
-      if (toCreate.variants && toCreate.variants.length && toCreate.variants[0].barcode) {
-        toCreate.barcode = toCreate.variants[0].barcode;
-      } else {
-        toCreate.barcode = generateBarcode();
+    // UPLOAD FILES TO IMAGEKIT (from disk) -> collect URLs
+    const uploadedImageUrls = [];
+    let invoiceUrl = null;
+
+    // handle images
+    if (req.files && req.files.images && Array.isArray(req.files.images)) {
+      for (const f of req.files.images) {
+        try {
+          const u = await uploadFilePathToImageKit(f.path, f.originalname, `/products/${req.user.id}`);
+          if (u) uploadedImageUrls.push(u);
+        } catch (err) {
+          console.warn('image upload failed for', f.path, err);
+        } finally {
+          // delete temp file regardless of success
+          try { await fs.unlink(f.path); } catch (e) { /* ignore */ }
+        }
       }
     }
 
-    console.log('>>> addProduct creating:', { name: toCreate.name, variants: toCreate.variants?.length, images: toCreate.images?.length || 0, sku: toCreate.sku, barcode: toCreate.barcode });
+    // invoice
+    if (req.files && req.files.invoice && Array.isArray(req.files.invoice) && req.files.invoice[0]) {
+      const f = req.files.invoice[0];
+      try {
+        const u = await uploadFilePathToImageKit(f.path, f.originalname, `/invoices/${req.user.id}`);
+        if (u) invoiceUrl = u;
+      } catch (err) {
+        console.warn('invoice upload failed', err);
+      } finally {
+        try { await fs.unlink(f.path); } catch (e) { /* ignore */ }
+      }
+    }
+
+    // fallback: if req.files was upload.any (array) - handle by checking fieldname
+    if (Array.isArray(req.files) && req.files.length) {
+      for (const f of req.files) {
+        if (f.fieldname === 'images') {
+          try {
+            const u = await uploadFilePathToImageKit(f.path, f.originalname, `/products/${req.user.id}`);
+            if (u) uploadedImageUrls.push(u);
+          } catch (err) { console.warn(err); }
+          try { await fs.unlink(f.path); } catch (e) {}
+        } else if ((f.fieldname === 'invoice' || f.fieldname === 'invoices') && !invoiceUrl) {
+          try {
+            const u = await uploadFilePathToImageKit(f.path, f.originalname, `/invoices/${req.user.id}`);
+            if (u) invoiceUrl = u;
+          } catch (err) { console.warn(err); }
+          try { await fs.unlink(f.path); } catch (e) {}
+        }
+      }
+    }
+
+    // Now build product payload and save product document (store image URLs)
+    const description = body.description || '';
+    const brand = body.brand || 'generic';
+
+    // Normalize variants into the shape your model expects
+    const normalizedVariants = (incomingVariants || []).map(v => ({
+      name: v.name || v.form || 'default',
+      sku: v.sku || '', // you may generate sku here if needed
+      barcode: v.barcode || '',
+      quantity: Number(v.quantity || 0),
+      originalPrice: Number(v.price || v.originalPrice || 0),
+      price: Number(v.price || v.originalPrice || 0),
+      images: Array.isArray(v.images) ? v.images : []
+    }));
+
+    // either create or update existing product for this owner and name
+    let product = await Product.findOne({ createdBy: req.user.id, prodName });
+    if (product) {
+      // merge
+      if (normalizedVariants.length) {
+        // for simplicity append variants (or implement merge-by-name logic)
+        product.variants = product.variants.concat(normalizedVariants);
+      }
+      if (uploadedImageUrls.length) product.images = (product.images || []).concat(uploadedImageUrls);
+      if (invoiceUrl) product.invoiceLink = invoiceUrl;
+      product.description = description || product.description;
+      product.brand = brand || product.brand;
+      await product.save();
+      return res.status(200).json({ product, message: 'Product updated (images uploaded)' });
+    }
+
+    // create new
+    const toCreate = {
+      prodName,
+      description,
+      brand,
+      images: uploadedImageUrls,
+      invoiceLink: invoiceUrl,
+      variants: normalizedVariants,
+      createdBy: req.user.id
+    };
 
     const created = await Product.create(toCreate);
     return res.status(201).json({ product: created });
   } catch (err) {
-    console.error('addProduct error:', err);
-    if (err && err.name === 'ValidationError') {
-      const list = Object.values(err.errors).map(e => e.message);
-      return res.status(400).json({ message: 'Validation error', errors: list });
-    }
+    console.error('addProduct error:', err && err.stack ? err.stack : err);
     return res.status(500).json({ message: 'Server error', error: err.message || String(err) });
   }
 };
-
-/* ---------- updateProduct (ensures sku/barcode & handles files) ---------- */
+/* ---------- updateProduct ---------- */
 export const updateProduct = async (req, res) => {
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
@@ -286,16 +259,19 @@ export const updateProduct = async (req, res) => {
     const id = req.params.id;
     const product = await Product.findById(id);
     if (!product) return res.status(404).json({ message: 'Product not found' });
-    if (product.createdBy.toString() !== req.user.id) return res.status(403).json({ message: 'Not your product' });
+    if (product.createdBy && product.createdBy.toString() !== req.user.id) return res.status(403).json({ message: 'Not your product' });
 
     const body = req.body || {};
 
     if (body.name) product.name = String(body.name).trim();
+    if (body.prodName) product.prodName = String(body.prodName).trim();
     if (body.description) product.description = body.description;
+    if (body.brand) product.brand = body.brand;
+    if (body.isImported !== undefined) product.imported = (body.isImported === 'true' || body.isImported === true);
 
     if (body.actualPrice !== undefined) {
       const p = toNumber(body.actualPrice);
-      if (p !== undefined) product.actualPrice = p;
+      if (p !== undefined) { product.actualPrice = p; product.price = p; }
     }
     if (body.discountPrice !== undefined) {
       const dp = toNumber(body.discountPrice);
@@ -318,47 +294,61 @@ export const updateProduct = async (req, res) => {
       product.variants = mergeVariants(product.variants || [], incomingVariants);
     }
 
-    // handle files (same as addProduct)
-    let imagesPayload = [];
-    let invoicePayload = null;
+    // upload new images/invoice if provided
+    let imageUrls = [];
+    let invoiceLink = null;
 
     if (req.files) {
       if (req.files.images && Array.isArray(req.files.images)) {
-        imagesPayload = req.files.images.map(f => ({ filename: f.originalname, mimeType: f.mimetype, data: f.buffer }));
+        for (const f of req.files.images) {
+          try {
+            const url = await uploadBufferToImageKit(f.buffer, f.originalname, `/products/${req.user.id}`);
+            if (url) imageUrls.push(url);
+          } catch (e) { console.warn('ImageKit upload failed for image', f.originalname, e && e.message); }
+        }
       }
       if (req.files.invoice && Array.isArray(req.files.invoice) && req.files.invoice[0]) {
         const f = req.files.invoice[0];
-        invoicePayload = { filename: f.originalname, mimeType: f.mimetype, data: f.buffer };
+        try {
+          const url = await uploadBufferToImageKit(f.buffer, f.originalname, `/invoices/${req.user.id}`);
+          if (url) invoiceLink = url;
+        } catch (e) { console.warn('ImageKit upload failed for invoice', f.originalname, e && e.message); }
       }
-      if ((!imagesPayload || imagesPayload.length === 0) && Array.isArray(req.files)) {
+      if ((!imageUrls || imageUrls.length === 0) && Array.isArray(req.files)) {
         for (const f of req.files) {
-          if (f.fieldname === 'images') imagesPayload.push({ filename: f.originalname, mimeType: f.mimetype, data: f.buffer });
-          else if (f.fieldname === 'invoice' && !invoicePayload) invoicePayload = { filename: f.originalname, mimeType: f.mimetype, data: f.buffer };
+          if (f.fieldname === 'images') {
+            try {
+              const url = await uploadBufferToImageKit(f.buffer, f.originalname, `/products/${req.user.id}`);
+              if (url) imageUrls.push(url);
+            } catch (e) { console.warn('imagekit err', e && e.message); }
+          } else if ((f.fieldname === 'invoice' || f.fieldname === 'invoices') && !invoiceLink) {
+            try {
+              const url = await uploadBufferToImageKit(f.buffer, f.originalname, `/invoices/${req.user.id}`);
+              if (url) invoiceLink = url;
+            } catch (e) { console.warn('imagekit err', e && e.message); }
+          }
         }
       }
     }
 
-    if (imagesPayload.length) {
+    if (imageUrls.length) {
+      const mapped = mapImageUrlsToSchema(imageUrls);
       product.images = product.images || [];
-      for (const img of imagesPayload) product.images.push({ filename: img.filename, mimeType: img.mimeType, data: img.data });
+      if (product.images.length && typeof product.images[0] === 'string' && typeof mapped[0] === 'string') {
+        product.images.push(...mapped);
+      } else if (product.images.length && typeof product.images[0] === 'object' && typeof mapped[0] === 'object') {
+        product.images.push(...mapped);
+      } else {
+        product.images = product.images.concat(mapped);
+      }
     }
-    if (invoicePayload) product.invoice = { filename: invoicePayload.filename, mimeType: invoicePayload.mimeType, data: invoicePayload.data };
-
-    // ensure sku/barcode exist
-    if (!product.sku || product.sku === '') {
-      if (product.variants && product.variants.length && product.variants[0].sku) product.sku = product.variants[0].sku;
-      else product.sku = generateSku(product.name || 'PRD');
-    }
-    if (!product.barcode || product.barcode === '') {
-      if (product.variants && product.variants.length && product.variants[0].barcode) product.barcode = product.variants[0].barcode;
-      else product.barcode = generateBarcode();
-    }
+    if (invoiceLink) product.invoiceLink = invoiceLink;
 
     await product.save();
     return res.json({ product });
   } catch (err) {
-    console.error('updateProduct error', err);
-    return res.status(500).json({ message: 'Server error', error: err.message });
+    console.error('updateProduct error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ message: 'Server error', error: err.message || String(err) });
   }
 };
 
@@ -369,22 +359,54 @@ export const listProducts = async (req, res) => {
     const products = await Product.find({ createdBy: req.user.id }).sort({ createdAt: -1 });
     return res.json({ products });
   } catch (err) {
-    console.error('listProducts error', err);
+    console.error('listProducts error', err && err.stack ? err.stack : err);
     return res.status(500).json({ message: 'Server error' });
   }
 };
 export const getProducts = listProducts;
 
+const isObjectIdString = (s) => typeof s === 'string' && /^[0-9a-fA-F]{24}$/.test(s);
+
+/**
+ * GET /api/owner/product/:id
+ * Supports either 24-hex Mongo id or product name (exact or case-insensitive)
+ */
 export const getProduct = async (req, res) => {
   try {
     if (!req.user || req.user.role !== 'owner') return res.status(403).json({ message: 'Only owner allowed' });
-    const product = await Product.findById(req.params.id);
-    if (!product) return res.status(404).json({ message: 'Not found' });
-    if (product.createdBy.toString() !== req.user.id) return res.status(403).json({ message: 'Not your product' });
+
+    const q = (req.params.id || req.query.q || '').trim();
+    if (!q) return res.status(400).json({ message: 'Missing product id or name' });
+
+    let product = null;
+
+    if (isObjectIdString(q)) {
+      product = await Product.findById(q);
+    }
+
+    if (!product) {
+      product = await Product.findOne({ createdBy: req.user.id, prodName: q }) ||
+                await Product.findOne({ createdBy: req.user.id, name: q });
+    }
+
+    if (!product) {
+      product = await Product.findOne({ createdBy: req.user.id, prodName: new RegExp(`^${q}$`, 'i') }) ||
+                await Product.findOne({ createdBy: req.user.id, name: new RegExp(`^${q}$`, 'i') });
+    }
+
+    if (!product) return res.status(404).json({ message: 'Product not found' });
+
+    if (product.createdBy && product.createdBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Not your product' });
+    }
+
     return res.json({ product });
   } catch (err) {
-    console.error('getProduct error', err);
-    return res.status(500).json({ message: 'Server error' });
+    console.error('getProduct error:', err && err.stack ? err.stack : err);
+    if (err && (err.name === 'CastError' || err.name === 'BSONTypeError')) {
+      return res.status(400).json({ message: 'Invalid product id' });
+    }
+    return res.status(500).json({ message: 'Server error', error: err?.message || String(err) });
   }
 };
 
@@ -397,7 +419,7 @@ export const deleteProduct = async (req, res) => {
     await product.deleteOne();
     return res.json({ message: 'Product deleted' });
   } catch (err) {
-    console.error('deleteProduct error', err);
+    console.error('deleteProduct error:', err && err.stack ? err.stack : err);
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
